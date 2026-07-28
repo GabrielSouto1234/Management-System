@@ -8070,16 +8070,8 @@ function startAppIfNeeded(){
 
 (async function initAuth(){
   await seedDefaultAdminIfNeeded();
-  const session = getSession();
-  if(session && session.usuario){
-    const users = loadUsers();
-    const user = users.find(u => u.usuario === session.usuario);
-    if(user){
-      enterApp(user);
-      return;
-    }
-  }
-  // no valid session: show the login screen and wait for the user to sign in
+  // O sistema deve sempre abrir na tela de login, mesmo que exista uma sessao salva.
+  clearSession();
   setTimeout(() => document.getElementById('login-usuario')?.focus(), 200);
 })();
 
