@@ -3066,13 +3066,13 @@ async function seedDefaultAdminIfNeeded(){
 }
 
 function getSession(){
-  try{ return JSON.parse(localStorage.getItem(SESSION_KEY)); }catch(e){ return null; }
+  try{ return JSON.parse(sessionStorage.getItem(SESSION_KEY)); }catch(e){ return null; }
 }
 function setSession(usuario){
-  try{ localStorage.setItem(SESSION_KEY, JSON.stringify({ usuario, at: new Date().toISOString() })); }catch(e){}
+  try{ sessionStorage.setItem(SESSION_KEY, JSON.stringify({ usuario, at: new Date().toISOString() })); }catch(e){}
 }
 function clearSession(){
-  try{ localStorage.removeItem(SESSION_KEY); }catch(e){}
+  try{ sessionStorage.removeItem(SESSION_KEY); }catch(e){}
 }
 
 async function tryLogin(){
@@ -8070,8 +8070,17 @@ function startAppIfNeeded(){
 
 (async function initAuth(){
   await seedDefaultAdminIfNeeded();
-  // O sistema deve sempre abrir na tela de login, mesmo que exista uma sessao salva.
-  clearSession();
+  // sessionStorage mantem login durante um F5 (atualizar pagina),
+  // mas some quando a aba/navegador e fechado e reaberto - af onde sempre volta pro login.
+  const session = getSession();
+  if(session && session.usuario){
+    const users = loadUsers();
+    const user = users.find(u => u.usuario === session.usuario);
+    if(user){
+      enterApp(user);
+      return;
+    }
+  }
   setTimeout(() => document.getElementById('login-usuario')?.focus(), 200);
 })();
 
