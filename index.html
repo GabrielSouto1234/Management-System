@@ -8118,7 +8118,11 @@ async function ensureSupabaseAuth(){
   }catch(e){ console.error('[Supabase Auth] erro inesperado:', e); return false; }
 }
 
+const SUPABASE_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 function getOrCreateSupabaseId(localId, entityKey){
+  // Se o id local ja e um UUID valido (por exemplo, um registro que veio de um pull anterior
+  // da nuvem), reaproveita ele direto em vez de gerar um novo - evita duplicar o mesmo registro.
+  if(SUPABASE_UUID_RE.test(localId)) return localId;
   const MAP_KEY = 'jorge_supabase_id_map_v1';
   let map = {};
   try{ map = JSON.parse(localStorage.getItem(MAP_KEY)) || {}; }catch(e){}
@@ -8128,6 +8132,33 @@ function getOrCreateSupabaseId(localId, entityKey){
     localStorage.setItem(MAP_KEY, JSON.stringify(map));
   }
   return map[compoundKey];
+}
+
+// Guarda quais IDs existiam na nuvem na ultima vez que baixamos cada modulo.
+// Usado para diferenciar "registro novo, ainda nao sincronizado" de "registro que foi
+// deletado na nuvem e precisa sumir daqui tambem".
+function getLastSeenSupabaseIds(entityKey){
+  try{
+    const m = JSON.parse(localStorage.getItem('jorge_supabase_last_seen_ids_v1')) || {};
+    return new Set(m[entityKey] || []);
+  }catch(e){ return new Set(); }
+}
+function setLastSeenSupabaseIds(entityKey, ids){
+  let m = {};
+  try{ m = JSON.parse(localStorage.getItem('jorge_supabase_last_seen_ids_v1')) || {}; }catch(e){}
+  m[entityKey] = ids;
+  try{ localStorage.setItem('jorge_supabase_last_seen_ids_v1', JSON.stringify(m)); }catch(e){}
+}
+// Remove da lista local os itens que existiam na nuvem antes e sumiram (foram deletados
+// em outro aparelho), sem mexer em itens criados localmente que ainda nao foram sincronizados.
+function removeLocallyDeletedItems(localList, cloudIds, entityKey){
+  const lastSeen = getLastSeenSupabaseIds(entityKey);
+  return localList.filter(item => {
+    const supaId = getOrCreateSupabaseId(item.id, entityKey);
+    const wasKnownBefore = lastSeen.has(supaId);
+    const stillExists = cloudIds.has(supaId);
+    return !(wasKnownBefore && !stillExists);
+  });
 }
 
 /* ---- Suppliers (Fornecedores) — modulo de exemplo, 100% funcional ---- */
@@ -8190,11 +8221,408 @@ deleteSupplier = function(id){
   }
 };
 
-/* ---- Login: autentica no Supabase assim que o usuario entra no sistema ---- */
+function supabaseRowToSupplier(row){
+  return {
+    id: row.id,
+    nome: row.name || '',
+    telefone: row.phone || '',
+    email: row.email || '',
+    endereco: row.address || '',
+    banco: row.bank_name || '',
+    agencia: row.bank_routing || '',
+    conta: row.bank_account || '',
+    pixZelle: row.pix_key || '',
+    observacoes: row.notes || '',
+    createdAt: row.created_at || new Date().toISOString()
+  };
+}
+
+async function pullSuppliersFromSupabase(){
+  try{
+    const { data, error } = await supabaseClient.from('suppliers').select('*').eq('is_deleted', false);
+    if(error){ console.error('[Supabase sync] falha ao buscar suppliers:', error.message); return; }
+    if(!data) return;
+    const cloudIds = new Set(data.map(row => row.id));
+    const survivors = removeLocallyDeletedItems(loadSuppliers(), cloudIds, 'suppliers');
+    const localById = new Map(survivors.map(s => [s.id, s]));
+    data.forEach(row => { localById.set(row.id, supabaseRowToSupplier(row)); });
+    __originalSaveSuppliers(Array.from(localById.values())); // grava local sem re-disparar sync pra nuvem
+    setLastSeenSupabaseIds('suppliers', Array.from(cloudIds));
+    if(typeof renderSuppliers === 'function'){
+      try{ renderSuppliers(); }catch(e){}
+    }
+  }catch(e){
+    console.error('[Supabase sync] erro inesperado ao buscar suppliers:', e);
+  }
+}
+
+/* ---- Clients (Clientes) ---- */
+function clientToSupabaseRow(c){
+  return {
+    id: getOrCreateSupabaseId(c.id, 'clients'),
+    company_id: SUPABASE_COMPANY_ID,
+    name: c.nome || '',
+    phone: c.telefone || null,
+    email: c.email || null,
+    address: c.endereco || null,
+    notes: [c.observacoes, c.pixZelle ? ('PIX/Zelle: ' + c.pixZelle) : null].filter(Boolean).join(' | ') || null
+  };
+}
+function supabaseRowToClient(row){
+  return {
+    id: row.id,
+    nome: row.name || '',
+    telefone: row.phone || '',
+    email: row.email || '',
+    endereco: row.address || '',
+    pixZelle: '',
+    observacoes: row.notes || '',
+    createdAt: row.created_at || new Date().toISOString()
+  };
+}
+async function syncClientsToSupabase(list){
+  const ok = await ensureSupabaseAuth();
+  if(!ok) return;
+  try{
+    const rows = list.map(clientToSupabaseRow);
+    if(rows.length === 0) return;
+    const { error } = await supabaseClient.from('clients').upsert(rows, { onConflict: 'id' });
+    if(error) console.error('[Supabase sync] clients upsert failed:', error.message);
+  }catch(e){ console.error('[Supabase sync] unexpected error:', e); }
+}
+async function deleteClientFromSupabase(localId){
+  const ok = await ensureSupabaseAuth();
+  if(!ok) return;
+  try{
+    const supaId = getOrCreateSupabaseId(localId, 'clients');
+    const { error } = await supabaseClient.from('clients').delete().eq('id', supaId);
+    if(error) console.error('[Supabase sync] clients delete failed:', error.message);
+  }catch(e){ console.error('[Supabase sync] unexpected error:', e); }
+}
+async function pullClientsFromSupabase(){
+  try{
+    const { data, error } = await supabaseClient.from('clients').select('*').eq('is_deleted', false);
+    if(error){ console.error('[Supabase sync] falha ao buscar clients:', error.message); return; }
+    if(!data) return;
+    const cloudIds = new Set(data.map(row => row.id));
+    const survivors = removeLocallyDeletedItems(loadClients(), cloudIds, 'clients');
+    const localById = new Map(survivors.map(c => [c.id, c]));
+    data.forEach(row => { localById.set(row.id, supabaseRowToClient(row)); });
+    __originalSaveClients(Array.from(localById.values()));
+    setLastSeenSupabaseIds('clients', Array.from(cloudIds));
+    if(typeof renderClients === 'function'){ try{ renderClients(); }catch(e){} }
+  }catch(e){ console.error('[Supabase sync] erro inesperado ao buscar clients:', e); }
+}
+
+const __originalSaveClients = saveClients;
+saveClients = function(list){
+  __originalSaveClients(list);
+  syncClientsToSupabase(list);
+};
+const __originalDeleteClient = deleteClient;
+deleteClient = function(id){
+  const listBefore = loadClients();
+  const existed = listBefore.some(c => c.id === id);
+  __originalDeleteClient(id);
+  const listAfter = loadClients();
+  if(existed && !listAfter.some(c => c.id === id)){
+    deleteClientFromSupabase(id);
+  }
+};
+
+/* ---- Banks (Meus Bancos) ---- */
+function bankToSupabaseRow(b){
+  return {
+    id: getOrCreateSupabaseId(b.id, 'bank_accounts'),
+    company_id: SUPABASE_COMPANY_ID,
+    bank_name: b.nome || '',
+    routing_number: b.agencia || null,
+    account_number: b.conta || null,
+    notes: b.observacoes || null
+  };
+}
+function supabaseRowToBank(row){
+  return {
+    id: row.id,
+    nome: row.bank_name || '',
+    agencia: row.routing_number || '',
+    conta: row.account_number || '',
+    observacoes: row.notes || '',
+    createdAt: row.created_at || new Date().toISOString()
+  };
+}
+async function syncBanksToSupabase(list){
+  const ok = await ensureSupabaseAuth();
+  if(!ok) return;
+  try{
+    const rows = list.map(bankToSupabaseRow);
+    if(rows.length === 0) return;
+    const { error } = await supabaseClient.from('bank_accounts').upsert(rows, { onConflict: 'id' });
+    if(error) console.error('[Supabase sync] bank_accounts upsert failed:', error.message);
+  }catch(e){ console.error('[Supabase sync] unexpected error:', e); }
+}
+async function deleteBankFromSupabase(localId){
+  const ok = await ensureSupabaseAuth();
+  if(!ok) return;
+  try{
+    const supaId = getOrCreateSupabaseId(localId, 'bank_accounts');
+    const { error } = await supabaseClient.from('bank_accounts').delete().eq('id', supaId);
+    if(error) console.error('[Supabase sync] bank_accounts delete failed:', error.message);
+  }catch(e){ console.error('[Supabase sync] unexpected error:', e); }
+}
+async function pullBanksFromSupabase(){
+  try{
+    const { data, error } = await supabaseClient.from('bank_accounts').select('*');
+    if(error){ console.error('[Supabase sync] falha ao buscar bank_accounts:', error.message); return; }
+    if(!data) return;
+    const cloudIds = new Set(data.map(row => row.id));
+    const survivors = removeLocallyDeletedItems(loadBanks(), cloudIds, 'bank_accounts');
+    const localById = new Map(survivors.map(b => [b.id, b]));
+    data.forEach(row => { localById.set(row.id, supabaseRowToBank(row)); });
+    __originalSaveBanks(Array.from(localById.values()));
+    setLastSeenSupabaseIds('bank_accounts', Array.from(cloudIds));
+    if(typeof renderBanksList === 'function'){ try{ renderBanksList(); }catch(e){} }
+  }catch(e){ console.error('[Supabase sync] erro inesperado ao buscar bank_accounts:', e); }
+}
+
+const __originalSaveBanks = saveBanks;
+saveBanks = function(list){
+  __originalSaveBanks(list);
+  syncBanksToSupabase(list);
+};
+const __originalDeleteBank = deleteBank;
+deleteBank = function(id){
+  const listBefore = loadBanks();
+  const existed = listBefore.some(b => b.id === id);
+  __originalDeleteBank(id);
+  const listAfter = loadBanks();
+  if(existed && !listAfter.some(b => b.id === id)){
+    deleteBankFromSupabase(id);
+  }
+};
+
+/* ---- Reminders (Lembretes) ---- */
+function reminderToSupabaseRow(r){
+  return {
+    id: getOrCreateSupabaseId(r.id, 'reminders'),
+    company_id: SUPABASE_COMPANY_ID,
+    title: r.titulo || '',
+    description: r.descricao || null,
+    due_date: r.data || null,
+    status: r.concluido ? 'completed' : 'pending'
+  };
+}
+function supabaseRowToReminder(row){
+  return {
+    id: row.id,
+    titulo: row.title || '',
+    descricao: row.description || '',
+    data: row.due_date || '',
+    tipo: 'lembrete',
+    concluido: row.status === 'completed',
+    createdAt: row.created_at || new Date().toISOString()
+  };
+}
+async function syncRemindersToSupabase(list){
+  const ok = await ensureSupabaseAuth();
+  if(!ok) return;
+  try{
+    const rows = list.map(reminderToSupabaseRow);
+    if(rows.length === 0) return;
+    const { error } = await supabaseClient.from('reminders').upsert(rows, { onConflict: 'id' });
+    if(error) console.error('[Supabase sync] reminders upsert failed:', error.message);
+  }catch(e){ console.error('[Supabase sync] unexpected error:', e); }
+}
+async function deleteReminderFromSupabase(localId){
+  const ok = await ensureSupabaseAuth();
+  if(!ok) return;
+  try{
+    const supaId = getOrCreateSupabaseId(localId, 'reminders');
+    const { error } = await supabaseClient.from('reminders').delete().eq('id', supaId);
+    if(error) console.error('[Supabase sync] reminders delete failed:', error.message);
+  }catch(e){ console.error('[Supabase sync] unexpected error:', e); }
+}
+async function pullRemindersFromSupabase(){
+  try{
+    const { data, error } = await supabaseClient.from('reminders').select('*');
+    if(error){ console.error('[Supabase sync] falha ao buscar reminders:', error.message); return; }
+    if(!data) return;
+    const cloudIds = new Set(data.map(row => row.id));
+    const survivors = removeLocallyDeletedItems(loadReminders(), cloudIds, 'reminders');
+    const localById = new Map(survivors.map(r => [r.id, r]));
+    data.forEach(row => { localById.set(row.id, supabaseRowToReminder(row)); });
+    __originalSaveReminders(Array.from(localById.values()));
+    setLastSeenSupabaseIds('reminders', Array.from(cloudIds));
+    if(typeof renderReminders === 'function'){ try{ renderReminders(); }catch(e){} }
+  }catch(e){ console.error('[Supabase sync] erro inesperado ao buscar reminders:', e); }
+}
+
+const __originalSaveReminders = saveReminders;
+saveReminders = function(list){
+  __originalSaveReminders(list);
+  syncRemindersToSupabase(list);
+};
+const __originalDeleteReminder = deleteReminder;
+deleteReminder = function(id){
+  const listBefore = loadReminders();
+  const existed = listBefore.some(r => r.id === id);
+  __originalDeleteReminder(id);
+  const listAfter = loadReminders();
+  if(existed && !listAfter.some(r => r.id === id)){
+    deleteReminderFromSupabase(id);
+  }
+};
+
+/* ---- Proposals (Propostas + itens de servico) ---- */
+function computeProposalTotal(p){
+  return (p.services || []).reduce((sum, s) => {
+    if(s.pricingType === 'sqft'){
+      return sum + (parseFloat(s.pricePerSqft) || 0) * (parseFloat(s.area) || 0);
+    }
+    return sum + (parseFloat(s.priceTotal) || 0);
+  }, 0);
+}
+function lookupClientSupabaseIdByName(name){
+  if(!name) return null;
+  const clients = loadClients();
+  const found = clients.find(c => (c.nome||'').trim().toLowerCase() === name.trim().toLowerCase());
+  if(!found) return null;
+  return getOrCreateSupabaseId(found.id, 'clients');
+}
+function lookupClientNameBySupabaseId(clientId){
+  if(!clientId) return '';
+  const clients = loadClients();
+  const found = clients.find(c => c.id === clientId);
+  return found ? found.nome : '';
+}
+function proposalToSupabaseRow(p){
+  const total = computeProposalTotal(p);
+  return {
+    id: getOrCreateSupabaseId(p.id, 'proposals'),
+    company_id: SUPABASE_COMPANY_ID,
+    client_id: lookupClientSupabaseIdByName(p.client),
+    proposal_number: p.number && p.number.trim() ? p.number.trim() : ('LOCAL-' + p.id),
+    description: p.observation || null,
+    status: 'draft',
+    issue_date: p.date || new Date().toISOString().slice(0,10),
+    subtotal: total,
+    total: total,
+    payment_terms: p.payment || null
+  };
+}
+function serviceToItemRow(s, supaProposalId, idx){
+  const isSqft = s.pricingType === 'sqft';
+  return {
+    proposal_id: supaProposalId,
+    description: [s.title, s.description].filter(Boolean).join(' — ') || 'Item',
+    quantity: isSqft ? (parseFloat(s.area) || 1) : 1,
+    unit_price: isSqft ? (parseFloat(s.pricePerSqft) || 0) : (parseFloat(s.priceTotal) || 0),
+    sort_order: idx
+  };
+}
+async function syncProposalsToSupabase(list){
+  const ok = await ensureSupabaseAuth();
+  if(!ok) return;
+  try{
+    for(const p of list){
+      const row = proposalToSupabaseRow(p);
+      const { error: propError } = await supabaseClient.from('proposals').upsert([row], { onConflict: 'id' });
+      if(propError){ console.error('[Supabase sync] proposals upsert failed:', propError.message); continue; }
+
+      // Reescreve os itens do zero (mais simples e seguro do que tentar diferenciar o que mudou)
+      const { error: delError } = await supabaseClient.from('proposal_items').delete().eq('proposal_id', row.id);
+      if(delError){ console.error('[Supabase sync] proposal_items delete failed:', delError.message); continue; }
+
+      const itemRows = (p.services || []).map((s, idx) => serviceToItemRow(s, row.id, idx));
+      if(itemRows.length > 0){
+        const { error: itemsError } = await supabaseClient.from('proposal_items').insert(itemRows);
+        if(itemsError) console.error('[Supabase sync] proposal_items insert failed:', itemsError.message);
+      }
+    }
+  }catch(e){ console.error('[Supabase sync] unexpected error:', e); }
+}
+async function deleteProposalFromSupabase(localId){
+  const ok = await ensureSupabaseAuth();
+  if(!ok) return;
+  try{
+    const supaId = getOrCreateSupabaseId(localId, 'proposals');
+    // proposal_items e apagado automaticamente (ON DELETE CASCADE no schema)
+    const { error } = await supabaseClient.from('proposals').delete().eq('id', supaId);
+    if(error) console.error('[Supabase sync] proposals delete failed:', error.message);
+  }catch(e){ console.error('[Supabase sync] unexpected error:', e); }
+}
+function supabaseRowsToProposal(row, itemRows){
+  return {
+    id: row.id,
+    number: row.proposal_number || '',
+    date: row.issue_date || '',
+    client: lookupClientNameBySupabaseId(row.client_id),
+    observation: row.description || '',
+    payment: row.payment_terms || '',
+    createdAt: row.created_at || new Date().toISOString(),
+    services: (itemRows || []).sort((a,b) => (a.sort_order||0)-(b.sort_order||0)).map(it => ({
+      title: it.description || '',
+      description: '',
+      pricingType: (parseFloat(it.quantity) !== 1) ? 'sqft' : 'total',
+      priceTotal: (parseFloat(it.quantity) === 1) ? it.unit_price : '',
+      pricePerSqft: (parseFloat(it.quantity) !== 1) ? it.unit_price : '',
+      area: (parseFloat(it.quantity) !== 1) ? it.quantity : '',
+      images: []
+    }))
+  };
+}
+async function pullProposalsFromSupabase(){
+  try{
+    const { data: proposalRows, error } = await supabaseClient.from('proposals').select('*').eq('is_deleted', false);
+    if(error){ console.error('[Supabase sync] falha ao buscar proposals:', error.message); return; }
+    if(!proposalRows) return;
+    const { data: itemRows, error: itemsError } = await supabaseClient.from('proposal_items').select('*');
+    if(itemsError){ console.error('[Supabase sync] falha ao buscar proposal_items:', itemsError.message); return; }
+
+    const cloudIds = new Set(proposalRows.map(row => row.id));
+    const survivors = removeLocallyDeletedItems(loadProposals(), cloudIds, 'proposals');
+    const localById = new Map(survivors.map(p => [p.id, p]));
+    proposalRows.forEach(row => {
+      const items = (itemRows || []).filter(it => it.proposal_id === row.id);
+      localById.set(row.id, supabaseRowsToProposal(row, items));
+    });
+    __originalSaveProposals(Array.from(localById.values()));
+    setLastSeenSupabaseIds('proposals', Array.from(cloudIds));
+    if(typeof renderProposals === 'function'){ try{ renderProposals(); }catch(e){} }
+  }catch(e){ console.error('[Supabase sync] erro inesperado ao buscar proposals:', e); }
+}
+
+const __originalSaveProposals = saveProposals;
+saveProposals = function(list){
+  __originalSaveProposals(list);
+  syncProposalsToSupabase(list);
+};
+const __originalDeleteProposal = (typeof deleteProposal === 'function') ? deleteProposal : null;
+if(__originalDeleteProposal){
+  deleteProposal = function(id){
+    const listBefore = loadProposals();
+    const existed = listBefore.some(p => p.id === id);
+    __originalDeleteProposal(id);
+    const listAfter = loadProposals();
+    if(existed && !listAfter.some(p => p.id === id)){
+      deleteProposalFromSupabase(id);
+    }
+  };
+}
+
+/* ---- Login: autentica no Supabase e baixa os dados da nuvem pro aparelho ---- */
 const __originalEnterApp = enterApp;
 enterApp = function(user){
   __originalEnterApp(user);
-  ensureSupabaseAuth();
+  ensureSupabaseAuth().then(async ok => {
+    if(ok){
+      await pullSuppliersFromSupabase();
+      await pullClientsFromSupabase();
+      await pullBanksFromSupabase();
+      await pullRemindersFromSupabase();
+      await pullProposalsFromSupabase();
+    }
+  });
 };
 </script>
 </body>
